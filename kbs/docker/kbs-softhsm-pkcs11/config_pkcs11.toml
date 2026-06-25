@@ -1,0 +1,25 @@
+[storage_backend]
+storage_type = "LocalFs"
+
+[storage_backend.backends.local_fs]
+dir_path = "/etc/kbs/repository"
+
+# Disable HTTPS for simplicity in testing
+[http_server]
+sockets = ["0.0.0.0:8080"]
+insecure_http = true
+
+[admin]
+# Do not use this in production.
+authorization_mode = "InsecureAllowAll"
+
+[attestation_token]
+insecure_header_jwk = true
+
+[[plugins]]
+name = "pkcs11"
+module = "/usr/lib/softhsm/libsofthsm2.so"
+pin = "1234"
+slot_index = 0
+lookup_label = "kbs-key"
+rsa_mechanism = "RsaPkcsTest"
