@@ -13,7 +13,7 @@ use key_value_storage::{KeyValueStorageType, StorageBackendConfig, StorageProvid
 use rsa::rand_core::{OsRng, RngCore};
 use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -342,7 +342,7 @@ impl AttestationService {
 
     async fn __attest(
         &self,
-        attestation: &[u8],
+        attestation_bytes: &[u8],
         request: HttpRequest,
     ) -> anyhow::Result<HttpResponse> {
         ATTESTATION_REQUESTS.inc();
@@ -354,7 +354,7 @@ impl AttestationService {
 
         let session_id = cookie.value();
 
-        let attestation: Attestation = serde_json::from_slice(attestation)
+        let attestation: Attestation = serde_json::from_slice(attestation_bytes)
             .inspect_err(|_| ATTESTATION_ERRORS.inc())
             .context("deserialize Attestation")?;
         let (tee, nonce) = {
@@ -410,11 +410,24 @@ impl AttestationService {
             "nonce": nonce,
         });
 
-        let primary_runtime_data = json!({
+        let mut primary_runtime_data = json!({
             "tee-pubkey": attestation.runtime_data.tee_pubkey,
             "nonce": nonce,
             "additional-evidence": attestation.tee_evidence.additional_evidence,
         });
+
+        // Merge any custom runtime_data claims sent by the client (e.g. disk_nonce, boot_counter, version)
+        if let Ok(Value::Object(raw_body)) = serde_json::from_slice(attestation_bytes) {
+            if let Some(Value::Object(extra_claims)) = raw_body.get("runtime_data") {
+                if let Some(primary_obj) = primary_runtime_data.as_object_mut() {
+                    for (k, v) in extra_claims {
+                        if k != "nonce" && k != "tee-pubkey" && k != "additional-evidence" {
+                            primary_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         let mut primary_evidence = IndependentEvidence {
             tee,
