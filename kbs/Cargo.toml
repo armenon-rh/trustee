@@ -48,6 +48,9 @@ nebula-ca-plugin = []
 # Spire plugin
 spire-plugin = ["spire-api"]
 
+# Modular SVSM CocoonFS Anti-Replay state protection
+svsm-anti-replay = []
+
 # Use HashiCorp Vault KV v1 as KBS backend
 vault = ["vaultrs"]
 
