@@ -45,6 +45,9 @@ pkcs11 = ["cryptoki"]
 # that want to join a Nebula overlay network
 nebula-ca-plugin = []
 
+# Modular SVSM CocoonFS Anti-Replay state protection
+svsm-anti-replay = []
+
 # Use HashiCorp Vault KV v1 as KBS backend
 vault = ["vaultrs"]
 

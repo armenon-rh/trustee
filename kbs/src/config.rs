@@ -176,6 +176,11 @@ pub struct KbsConfig {
 
     #[serde(default)]
     pub plugins: Vec<PluginsConfig>,
+
+    /// Anti-replay protection for SVSM virtual disks
+    #[cfg(feature = "svsm-anti-replay")]
+    #[serde(default)]
+    pub svsm_anti_replay: crate::anti_replay::config::AntiReplayConfig,
 }
 
 /// The commit ref of the config documentation in the Trustee repository
@@ -263,7 +268,7 @@ pub struct Cli {
     pub config_file: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "svsm-anti-replay")))]
 mod tests {
     use std::path::Path;
 

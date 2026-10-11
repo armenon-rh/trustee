@@ -26,3 +26,6 @@ pub mod http;
 pub mod jwe;
 
 pub mod prometheus;
+
+#[cfg(feature = "svsm-anti-replay")]
+pub mod anti_replay;
