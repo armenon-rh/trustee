@@ -98,6 +98,10 @@ pub enum Error {
     #[error("Attestation Token not found")]
     TokenNotFound,
 
+    #[cfg(feature = "svsm-anti-replay")]
+    #[error("Anti-replay error: {0}")]
+    AntiReplay(#[from] crate::anti_replay::AntiReplayError),
+
     #[error("Token Verifier error")]
     TokenVerifierError(#[from] crate::token::Error),
 
@@ -139,6 +143,29 @@ impl ResponseError for Error {
             | Error::PluginNotFound { .. }
             | Error::ResourceNotFound { .. } => HttpResponse::NotFound(),
             Error::PolicyDeny => HttpResponse::Forbidden(),
+            #[cfg(feature = "svsm-anti-replay")]
+            Error::AntiReplay(crate::anti_replay::AntiReplayError::LeaseActive { .. }) => {
+                HttpResponse::Conflict()
+            }
+            #[cfg(feature = "svsm-anti-replay")]
+            Error::AntiReplay(crate::anti_replay::AntiReplayError::NonceMismatch)
+            | Error::AntiReplay(crate::anti_replay::AntiReplayError::CounterMismatch { .. }) => {
+                HttpResponse::Forbidden()
+            }
+            #[cfg(feature = "svsm-anti-replay")]
+            Error::AntiReplay(crate::anti_replay::AntiReplayError::NonceNotRegistered(..)) => {
+                HttpResponse::NotFound()
+            }
+            #[cfg(feature = "svsm-anti-replay")]
+            Error::AntiReplay(crate::anti_replay::AntiReplayError::BadRequest(..))
+            | Error::AntiReplay(crate::anti_replay::AntiReplayError::InvalidReportDataHex(..)) => {
+                HttpResponse::BadRequest()
+            }
+            #[cfg(feature = "svsm-anti-replay")]
+            Error::AntiReplay(crate::anti_replay::AntiReplayError::Storage(..))
+            | Error::AntiReplay(crate::anti_replay::AntiReplayError::StorageInit(..)) => {
+                HttpResponse::InternalServerError()
+            }
             _ => HttpResponse::Unauthorized(),
         };
 
@@ -164,5 +191,29 @@ mod tests {
     fn into_error_response(#[case] err: Error, #[case] expected: StatusCode) {
         let res = actix_web::ResponseError::error_response(&err);
         assert_eq!(res.status(), expected);
+    }
+
+    #[cfg(feature = "svsm-anti-replay")]
+    #[rstest]
+    #[case(crate::anti_replay::AntiReplayError::LeaseActive { expiry: 123 }, actix_web::http::StatusCode::CONFLICT)]
+    #[case(
+        crate::anti_replay::AntiReplayError::NonceMismatch,
+        actix_web::http::StatusCode::FORBIDDEN
+    )]
+    #[case(crate::anti_replay::AntiReplayError::CounterMismatch { expected: 1, presented: 2 }, actix_web::http::StatusCode::FORBIDDEN)]
+    #[case(crate::anti_replay::AntiReplayError::NonceNotRegistered("test".into()), actix_web::http::StatusCode::NOT_FOUND)]
+    #[case(crate::anti_replay::AntiReplayError::BadRequest("bad".into()), actix_web::http::StatusCode::BAD_REQUEST)]
+    #[case(crate::anti_replay::AntiReplayError::Storage("err".into()), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)]
+    #[case(
+        crate::anti_replay::AntiReplayError::MissingReportData,
+        actix_web::http::StatusCode::UNAUTHORIZED
+    )]
+    fn anti_replay_error_status(
+        #[case] ar_err: crate::anti_replay::AntiReplayError,
+        #[case] expected_status: actix_web::http::StatusCode,
+    ) {
+        let err = Error::AntiReplay(ar_err);
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), expected_status);
     }
 }
