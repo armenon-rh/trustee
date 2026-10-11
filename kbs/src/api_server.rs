@@ -59,6 +59,9 @@ pub struct ApiServer {
     admin: Admin,
     config: KbsConfig,
     token_verifier: TokenVerifier,
+
+    #[cfg(feature = "svsm-anti-replay")]
+    pub svsm_anti_replay: Option<crate::anti_replay::AntiReplayManager>,
 }
 
 impl ApiServer {
@@ -127,6 +130,19 @@ impl ApiServer {
 
         BUILD_INFO.inc();
 
+        #[cfg(feature = "svsm-anti-replay")]
+        let svsm_anti_replay = if config.svsm_anti_replay.enabled {
+            Some(
+                crate::anti_replay::AntiReplayManager::new(
+                    storage_provider.clone(),
+                    config.svsm_anti_replay.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             plugin_manager,
@@ -136,6 +152,9 @@ impl ApiServer {
 
             #[cfg(feature = "as")]
             attestation_service,
+
+            #[cfg(feature = "svsm-anti-replay")]
+            svsm_anti_replay,
         })
     }
 
@@ -249,6 +268,54 @@ pub(crate) async fn api(
 
     let policy_data_str = policy_data.to_string();
     match plugin {
+        #[cfg(feature = "svsm-anti-replay")]
+        "svsm" => {
+            if let Some(ar) = &core.svsm_anti_replay {
+                match resource_path {
+                    ["register-nonce"] if request.method() == Method::POST => {
+                        core.admin.check_admin_access(&request).map_err(|e| {
+                            Error::AdminAuthAccess {
+                                source: e,
+                                endpoint: "svsm/register-nonce".to_string(),
+                            }
+                        })?;
+                        return ar.handle_register_nonce(&body).await.map_err(From::from);
+                    }
+                    [endpoint] if request.method() == Method::POST => {
+                        let token = core
+                            .get_attestation_token(&request)
+                            .await
+                            .map_err(|_| Error::TokenNotFound)?;
+                        let claims = core.token_verifier.verify(token)?;
+
+                        match *endpoint {
+                            "roll-nonce" => ar
+                                .handle_roll_nonce(&claims, &body)
+                                .await
+                                .map_err(From::from),
+                            "heartbeat" => ar
+                                .handle_heartbeat(&claims, &body)
+                                .await
+                                .map_err(From::from),
+                            "release-lease" => ar
+                                .handle_release_lease(&claims, &body)
+                                .await
+                                .map_err(From::from),
+                            _ => Err(Error::InvalidRequestPath {
+                                path: path.to_string(),
+                            }),
+                        }
+                    }
+                    _ => Err(Error::InvalidRequestPath {
+                        path: path.to_string(),
+                    }),
+                }
+            } else {
+                Err(Error::PluginNotFound {
+                    plugin_name: plugin.to_string(),
+                })
+            }
+        }
         #[cfg(feature = "as")]
         "auth" if request.method() == Method::POST => core
             .attestation_service
@@ -446,6 +513,15 @@ pub(crate) async fn api(
                 }
                 KBS_POLICY_APPROVALS.inc();
 
+                #[cfg(feature = "svsm-anti-replay")]
+                let session_id = if let Some(ar) = &core.svsm_anti_replay {
+                    let full_resource_path = resource_path.join("/");
+                    ar.validate_resource_request(&full_resource_path, &claims)
+                        .await?
+                } else {
+                    None
+                };
+
                 let init_data = claims
                     .pointer("/submods/cpu0/ear.veraison.annotated-evidence/init_data_claims");
 
@@ -464,9 +540,13 @@ pub(crate) async fn api(
                     let jwe =
                         jwe(public_key, response).map_err(|e| Error::JweError { source: e })?;
                     let res = serde_json::to_string(&jwe)?;
-                    return Ok(HttpResponse::Ok()
-                        .content_type("application/json")
-                        .body(res));
+
+                    let mut http_resp = HttpResponse::Ok();
+                    #[cfg(feature = "svsm-anti-replay")]
+                    if let Some(sid) = session_id {
+                        http_resp.insert_header(("X-SVSM-Session-ID", sid));
+                    }
+                    return Ok(http_resp.content_type("application/json").body(res));
                 }
 
                 Ok(HttpResponse::Ok().content_type("text/xml").body(response))
