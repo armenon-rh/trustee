@@ -20,3 +20,8 @@ insecure_header_jwk = true
 name = "resource"
 storage_backend_type = "kvstorage"
 
+[svsm_anti_replay]
+enabled = true
+enforce_prefixes = ["default/vtpm/"]
+lease_duration_secs = 60
+
