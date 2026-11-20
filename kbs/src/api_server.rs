@@ -292,6 +292,10 @@ pub(crate) async fn api(
                                 .handle_release_lease(&body)
                                 .await
                                 .map_err(From::from),
+                            "sync-fs-counter" => ar
+                                .handle_sync_fs_counter(&body)
+                                .await
+                                .map_err(From::from),
                             // Privileged operation: strictly require valid JWT
                             "roll-nonce" => {
                                 let token = core

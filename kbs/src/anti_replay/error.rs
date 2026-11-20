@@ -29,6 +29,9 @@ pub enum AntiReplayError {
     #[error("Split-brain fork detected: presented boot counter ({presented}) does not match expected counter ({expected})")]
     CounterMismatch { expected: u64, presented: u64 },
 
+    #[error("State replay / rollback detected: presented fs_update_counter ({presented}) is behind the recorded value ({expected})")]
+    FsCounterMismatch { expected: String, presented: String },
+
     #[error("Resource is currently in use by an active VM session (lease expires at {expiry})")]
     LeaseActive { expiry: u64 },
 

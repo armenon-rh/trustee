@@ -149,7 +149,8 @@ impl ResponseError for Error {
             }
             #[cfg(feature = "svsm-anti-replay")]
             Error::AntiReplay(crate::anti_replay::AntiReplayError::NonceMismatch)
-            | Error::AntiReplay(crate::anti_replay::AntiReplayError::CounterMismatch { .. }) => {
+            | Error::AntiReplay(crate::anti_replay::AntiReplayError::CounterMismatch { .. })
+            | Error::AntiReplay(crate::anti_replay::AntiReplayError::FsCounterMismatch { .. }) => {
                 HttpResponse::Forbidden()
             }
             #[cfg(feature = "svsm-anti-replay")]
@@ -201,6 +202,7 @@ mod tests {
         actix_web::http::StatusCode::FORBIDDEN
     )]
     #[case(crate::anti_replay::AntiReplayError::CounterMismatch { expected: 1, presented: 2 }, actix_web::http::StatusCode::FORBIDDEN)]
+    #[case(crate::anti_replay::AntiReplayError::FsCounterMismatch { expected: "01".into(), presented: "00".into() }, actix_web::http::StatusCode::FORBIDDEN)]
     #[case(crate::anti_replay::AntiReplayError::NonceNotRegistered("test".into()), actix_web::http::StatusCode::NOT_FOUND)]
     #[case(crate::anti_replay::AntiReplayError::BadRequest("bad".into()), actix_web::http::StatusCode::BAD_REQUEST)]
     #[case(crate::anti_replay::AntiReplayError::Storage("err".into()), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)]

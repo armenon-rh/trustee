@@ -21,6 +21,12 @@ pub struct AntiReplayRecord {
     pub version: u8,
     pub boot_counter: u64,
     pub nonce: String, // 32-character hex string representing 16 raw bytes
+    /// CocoonFS's internal filesystem update counter, as last synced by SVSM -- a 32-character
+    /// hex string representing a 16-byte little-endian u128. `None` until the first
+    /// register-nonce or sync-fs-counter call reports one (including for records persisted
+    /// before this field existed, via `#[serde(default)]`).
+    #[serde(default)]
+    pub fs_update_counter: Option<String>,
     #[serde(default)]
     pub active_lease: Option<String>, // Active Session ID holding the lease
     #[serde(default)]
@@ -267,6 +273,124 @@ impl AntiReplayManager {
         })))
     }
 
+    /// Handles stateful fs_update_counter sync: POST /kbs/v0/svsm/sync-fs-counter
+    ///
+    /// Authenticated the same way as heartbeat/release-lease (resource_id + session_id matched
+    /// against the stored active_lease), not a Bearer token -- this fires on every committed
+    /// write (not just once per boot or every 25s), so requiring full JWT verification here
+    /// would reintroduce the token-expiry failure already hit and fixed for
+    /// heartbeat/release-lease, except on the hottest path in the whole design.
+    ///
+    /// `fs_update_counter` is a monotonic 128-bit counter (little-endian -- see
+    /// `cocoon-tpm-storage`'s `transaction::write_journal`), expected to climb across commits
+    /// rather than stay fixed like `nonce`/`boot_counter`, so the check is `presented >=
+    /// recorded`, not equality: a confirmed drop below the recorded value is evidence of a
+    /// spliced/rolled-back payload (an old encrypted image paired with a current plaintext
+    /// header). On rejection, `active_lease`/`lease_expiry` are cleared (the lease granted
+    /// moments earlier, based on the plaintext header alone, was bogus) without touching the
+    /// stored `fs_update_counter`, so the real, current disk still validates fine on its own
+    /// next sync.
+    pub async fn handle_sync_fs_counter(&self, body: &[u8]) -> Result<HttpResponse, AntiReplayError> {
+        #[derive(Deserialize)]
+        struct SyncFsCounterPayload {
+            resource_id: String,
+            session_id: String,
+            fs_update_counter: String,
+        }
+
+        let payload: SyncFsCounterPayload =
+            serde_json::from_slice(body).map_err(|e| AntiReplayError::BadRequest(e.to_string()))?;
+
+        let presented_bytes = hex::decode(&payload.fs_update_counter).map_err(|e| {
+            AntiReplayError::BadRequest(format!("Invalid hex fs_update_counter: {e}"))
+        })?;
+        let presented_bytes: [u8; 16] = presented_bytes.try_into().map_err(|v: Vec<u8>| {
+            AntiReplayError::BadRequest(format!(
+                "fs_update_counter must be 16 bytes, got {}",
+                v.len()
+            ))
+        })?;
+        let presented = u128::from_le_bytes(presented_bytes);
+
+        let raw_record = match self
+            .storage
+            .get(&payload.resource_id)
+            .await
+            .map_err(|e| AntiReplayError::Storage(e.to_string()))?
+        {
+            Some(bytes) if !bytes.is_empty() => bytes,
+            _ => return Err(AntiReplayError::NonceNotRegistered(payload.resource_id)),
+        };
+
+        let mut record: AntiReplayRecord = serde_json::from_slice(&raw_record)
+            .map_err(|e| AntiReplayError::Storage(format!("Corrupt record: {e}")))?;
+
+        if record.active_lease.as_deref() != Some(payload.session_id.as_str()) {
+            return Err(AntiReplayError::Unauthorized(
+                "Invalid session lease ID for sync_fs_counter".into(),
+            ));
+        }
+
+        if let Some(ref recorded_hex) = record.fs_update_counter {
+            let recorded_bytes = hex::decode(recorded_hex)
+                .map_err(|e| AntiReplayError::Storage(format!("Corrupt fs_update_counter: {e}")))?;
+            let recorded_bytes: [u8; 16] = recorded_bytes.try_into().map_err(|v: Vec<u8>| {
+                AntiReplayError::Storage(format!(
+                    "Corrupt fs_update_counter: expected 16 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            let recorded = u128::from_le_bytes(recorded_bytes);
+
+            if presented < recorded {
+                warn!(
+                    resource_id = %payload.resource_id,
+                    expected = %recorded_hex,
+                    presented = %payload.fs_update_counter,
+                    "Anti-replay mismatch: fs_update_counter went backward (possible header/payload splicing)"
+                );
+
+                record.active_lease = None;
+                record.lease_expiry = None;
+                let record_bytes = serde_json::to_vec(&record)
+                    .map_err(|e| AntiReplayError::Storage(e.to_string()))?;
+                self.storage
+                    .set(
+                        &payload.resource_id,
+                        &record_bytes,
+                        SetParameters {
+                            overwrite: true,
+                            ttl: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| AntiReplayError::Storage(e.to_string()))?;
+
+                return Err(AntiReplayError::FsCounterMismatch {
+                    expected: recorded_hex.clone(),
+                    presented: payload.fs_update_counter,
+                });
+            }
+        }
+
+        record.fs_update_counter = Some(payload.fs_update_counter);
+        let record_bytes =
+            serde_json::to_vec(&record).map_err(|e| AntiReplayError::Storage(e.to_string()))?;
+        self.storage
+            .set(
+                &payload.resource_id,
+                &record_bytes,
+                SetParameters {
+                    overwrite: true,
+                    ttl: None,
+                },
+            )
+            .await
+            .map_err(|e| AntiReplayError::Storage(e.to_string()))?;
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "synced" })))
+    }
+
     /// Handles clean shutdown lease release: POST /kbs/v0/svsm/release-lease
     pub async fn handle_release_lease(
         &self,
@@ -353,6 +477,9 @@ impl AntiReplayManager {
             version: payload.version.unwrap_or(1),
             boot_counter: payload.new_boot_counter,
             nonce: payload.new_nonce,
+            // Rolling the plaintext header nonce/boot_counter is independent of
+            // fs_update_counter tracking; preserve whatever was last synced.
+            fs_update_counter: existing.as_ref().and_then(|r| r.fs_update_counter.clone()),
             active_lease: existing.as_ref().and_then(|r| r.active_lease.clone()),
             lease_expiry: existing.as_ref().and_then(|r| r.lease_expiry),
         };
@@ -392,6 +519,8 @@ impl AntiReplayManager {
             resource_id: String,
             boot_counter: Option<u64>,
             nonce: String,
+            #[serde(default)]
+            fs_update_counter: Option<String>,
         }
 
         let payload: RegisterPayload =
@@ -404,10 +533,22 @@ impl AntiReplayManager {
             return Err(AntiReplayError::BadRequest("nonce must be 16 bytes".into()));
         }
 
+        if let Some(ref fs_update_counter) = payload.fs_update_counter {
+            let counter_bytes = hex::decode(fs_update_counter).map_err(|e| {
+                AntiReplayError::BadRequest(format!("Invalid hex fs_update_counter: {e}"))
+            })?;
+            if counter_bytes.len() != 16 {
+                return Err(AntiReplayError::BadRequest(
+                    "fs_update_counter must be 16 bytes".into(),
+                ));
+            }
+        }
+
         let record = AntiReplayRecord {
             version: payload.version.unwrap_or(1),
             boot_counter: payload.boot_counter.unwrap_or(1),
             nonce: payload.nonce,
+            fs_update_counter: payload.fs_update_counter,
             active_lease: None,
             lease_expiry: None,
         };
@@ -565,5 +706,85 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AntiReplayError::NonceMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_sync_fs_counter_mismatch_clears_lease() {
+        let storage = Arc::new(MemoryKeyValueStorage::default());
+        let mgr = AntiReplayManager {
+            config: AntiReplayConfig {
+                enabled: true,
+                enforce_prefixes: vec!["default/vtpm/".to_string()],
+                lease_duration_secs: 60,
+            },
+            storage,
+        };
+
+        let initial_counter = hex::encode(1u128.to_le_bytes());
+        let reg_body = serde_json::json!({
+            "version": 1,
+            "resource_id": "default/vtpm/vm1",
+            "boot_counter": 1,
+            "nonce": "11111111111111111111111111111111",
+            "fs_update_counter": initial_counter,
+        });
+        mgr.handle_register_nonce(&serde_json::to_vec(&reg_body).unwrap())
+            .await
+            .unwrap();
+
+        let valid_claims = serde_json::json!({
+            "submods": {
+                "cpu0": {
+                    "ear.veraison.annotated-evidence": {
+                        "runtime_data_claims": {
+                            "version": 1,
+                            "boot_counter": 1,
+                            "disk_nonce": "11111111111111111111111111111111"
+                        }
+                    }
+                }
+            }
+        });
+        let session_id = mgr
+            .validate_resource_request("default/vtpm/vm1", &valid_claims)
+            .await
+            .unwrap()
+            .expect("should return session lease ID");
+
+        // A legitimate forward sync (counter bumped to 2) succeeds.
+        let higher_counter = hex::encode(2u128.to_le_bytes());
+        let sync_body = serde_json::json!({
+            "resource_id": "default/vtpm/vm1",
+            "session_id": session_id,
+            "fs_update_counter": higher_counter,
+        });
+        mgr.handle_sync_fs_counter(&serde_json::to_vec(&sync_body).unwrap())
+            .await
+            .unwrap();
+
+        // Presenting a counter behind the recorded value (1 < 2) is a splice/rollback.
+        let stale_counter = hex::encode(1u128.to_le_bytes());
+        let stale_sync_body = serde_json::json!({
+            "resource_id": "default/vtpm/vm1",
+            "session_id": session_id,
+            "fs_update_counter": stale_counter,
+        });
+        let err = mgr
+            .handle_sync_fs_counter(&serde_json::to_vec(&stale_sync_body).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AntiReplayError::FsCounterMismatch { .. }));
+
+        // The rejected sync must have cleared the lease: a heartbeat with the same
+        // (now stale) session_id should be rejected as unauthorized.
+        let heartbeat_body = serde_json::json!({
+            "resource_id": "default/vtpm/vm1",
+            "session_id": session_id,
+        });
+        let heartbeat_err = mgr
+            .handle_heartbeat(&serde_json::to_vec(&heartbeat_body).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(heartbeat_err, AntiReplayError::Unauthorized(_)));
     }
 }
